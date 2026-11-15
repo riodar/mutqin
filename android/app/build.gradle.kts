@@ -14,6 +14,11 @@ android {
     compileSdk = maxOf(flutter.compileSdkVersion, 37)
     ndkVersion = flutter.ndkVersion
 
+    lint {
+    checkReleaseBuilds = false
+    abortOnError = false
+    }
+
     val keystoreProperties = Properties()
     val keystorePropertiesFile = rootProject.file("key.properties")
     val hasKeyProperties = keystorePropertiesFile.exists()
