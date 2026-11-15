@@ -1,3 +1,4 @@
+
 name: 02 - Build & Release App
 
 on:
@@ -19,9 +20,13 @@ permissions:
   contents: write
 
 jobs:
+  # ==========================================
+  # BUILD ANDROID
+  # ==========================================
   build_android:
     name: Build Android APKs
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,17 +44,27 @@ jobs:
           channel: 'stable'
           cache: true
 
+      - name: Verify Model Assets
+        shell: bash
+        run: |
+          echo "Checking assets/model..."
+
+          if [ ! -d "assets/model" ]; then
+            echo "ERROR: Folder assets/model tidak ditemukan!"
+            exit 1
+          fi
+
+          if ! find assets/model -type f -iname "*.onnx" -print -quit | grep -q .; then
+            echo "ERROR: File ONNX tidak ditemukan di assets/model!"
+            exit 1
+          fi
+
+          echo "Model files found:"
+          find assets/model -type f -printf '%p (%s bytes)\n'
+
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Create assets directory
-        run: mkdir -p assets/model
-
-      - name: Download Model from GitHub Cache
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download models-latest -p "*.onnx" --dir assets/model
-          
       - name: Build Split APKs
         run: flutter build apk --release --split-per-abi
 
@@ -69,9 +84,13 @@ jobs:
             ReciteQuran-x86_64.apk
           retention-days: 1
 
+  # ==========================================
+  # BUILD WINDOWS
+  # ==========================================
   build_windows:
     name: Build Windows EXE
     runs-on: windows-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -82,22 +101,38 @@ jobs:
           channel: 'stable'
           cache: true
 
+      - name: Verify Model Assets
+        shell: pwsh
+        run: |
+          Write-Host "Checking assets/model..."
+
+          if (!(Test-Path "assets\model")) {
+            throw "ERROR: Folder assets\model tidak ditemukan!"
+          }
+
+          $models = Get-ChildItem "assets\model" -Filter "*.onnx" -File -Recurse
+
+          if ($models.Count -eq 0) {
+            throw "ERROR: File ONNX tidak ditemukan di assets\model!"
+          }
+
+          Write-Host "Model files found:"
+          Get-ChildItem "assets\model" -File -Recurse |
+            ForEach-Object {
+              Write-Host "$($_.FullName) ($($_.Length) bytes)"
+            }
+
       - name: Install dependencies
         run: flutter pub get
-
-      - name: Create assets directory
-        run: mkdir assets\model
-
-      - name: Download Model from GitHub Cache
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release download models-latest -p "*.onnx" --dir assets\model
 
       - name: Build Windows
         run: flutter build windows --release
 
       - name: Zip Windows Build
-        run: Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath ReciteQuran_Windows.zip
+        run: |
+          Compress-Archive `
+            -Path build\windows\x64\runner\Release\* `
+            -DestinationPath ReciteQuran_Windows.zip
 
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
@@ -106,10 +141,14 @@ jobs:
           path: ReciteQuran_Windows.zip
           retention-days: 1
 
+  # ==========================================
+  # PUBLISH GITHUB RELEASE
+  # ==========================================
   publish_release:
     name: Publish Unified GitHub Release
     needs: [build_android, build_windows]
     runs-on: ubuntu-latest
+
     steps:
       - name: Download Android Artifacts
         uses: actions/download-artifact@v4
@@ -122,15 +161,6 @@ jobs:
         with:
           name: windows-build
           path: release_assets/
-
-      - name: Download Model from GitHub Cache
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p release_assets
-          # We don't checkout code here, just download the model directly via gh CLI
-          # To use gh CLI without checkout, we need to specify the repo
-          gh release download models-latest -p "*.onnx" --dir release_assets/ -R Iam-Muslim/ReciteQuran-ElhamduleAllah
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
