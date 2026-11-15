@@ -1,5 +1,7 @@
+
 import java.util.Properties
 import java.io.FileInputStream
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     id("com.android.application")
@@ -25,10 +27,6 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     defaultConfig {
         applicationId = "com.recitequran.app"
         minSdk = flutter.minSdkVersion
@@ -45,7 +43,12 @@ android {
                 val alias = keystoreProperties.getProperty("keyAlias")
                 val storePath = keystoreProperties.getProperty("storeFile")
 
-                if (storePass != null && keyPass != null && alias != null && storePath != null) {
+                if (
+                    storePass != null &&
+                    keyPass != null &&
+                    alias != null &&
+                    storePath != null
+                ) {
                     keyAlias = alias
                     keyPassword = keyPass
                     storeFile = file(storePath)
@@ -57,19 +60,25 @@ android {
 
     buildTypes {
         getByName("release") {
-            // Only apply release signing configuration if the key properties actually exist
-            if (hasKeyProperties && 
-                keystoreProperties.containsKey("storePassword") && 
-                keystoreProperties.containsKey("keyPassword") && 
-                keystoreProperties.containsKey("keyAlias") && 
-                keystoreProperties.containsKey("storeFile")) {
+            if (
+                hasKeyProperties &&
+                keystoreProperties.containsKey("storePassword") &&
+                keystoreProperties.containsKey("keyPassword") &&
+                keystoreProperties.containsKey("keyAlias") &&
+                keystoreProperties.containsKey("storeFile")
+            ) {
                 signingConfig = signingConfigs.getByName("release")
             } else {
-                println("WARNING: key.properties or signing keys missing. Building an UNSIGNED release.")
+                println(
+                    "WARNING: key.properties or signing keys missing. Building an UNSIGNED release."
+                )
                 signingConfig = null
             }
-            
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 
@@ -83,6 +92,13 @@ android {
 
     androidResources {
         noCompress += listOf("onnx", "txt", "json", "npy")
+    }
+}
+
+// Kotlin compiler configuration (pengganti kotlinOptions)
+kotlin {
+    compilerOptions {
+        jvmTarget = JvmTarget.JVM_17
     }
 }
 
