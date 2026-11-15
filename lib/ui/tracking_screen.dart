@@ -1,32 +1,36 @@
+import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
-import 'package:super_sliver_list/super_sliver_list.dart';
-import 'package:share_plus/share_plus.dart';
-import 'package:wakelock_plus/wakelock_plus.dart';
 
-import '../main.dart';
-import '../state/app_state.dart';
-import '../tracking/word/highlighting_controller.dart';
-import '../utils/debug_logger.dart';
-import 'widgets/dialogs/voice_search_dialog.dart';
+import '../core/highlighting_controller.dart';
+import '../audio/quran_timing_service.dart';
+import '../audio/quran_audio_service.dart';
+import '../audio/quran_download_service.dart';
+import '../core/platform_utils.dart';
+import 'widgets/dialogs/dialog_service.dart';
+import '../core/app_state.dart';
 import 'widgets/mic_bar.dart';
-import 'widgets/settings_dialog.dart';
-import 'widgets/surah_picker.dart';
-import 'widgets/verse_row.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'widgets/dialogs/speed_selection_dialog.dart';
+import '../mushaf/mushaf_view.dart';
+import '../verse_list/verse_list_view.dart';
+import '../maglis/maglis_controller.dart';
 
 /// Main interactive screen for real-time recitation tracking and reading.
-/// Manages scrolling, distraction-free reading headers, and mode switches.
+/// Supports high-performance vector Mushaf and dedicated Verse List modes.
 class TrackingScreen extends StatefulWidget {
   final HighlightingController controller;
   final bool isRecording;
   final bool isVoiceSearching;
   final String voiceSearchText;
+  final ValueListenable<String>? voiceSearchTextNotifier;
   final VoidCallback onToggleRecord;
   final VoidCallback onVoiceSearchToggle;
   final bool isLoadingEngine;
   final ValueNotifier<bool>? isVoiceSearchLoading;
+  final VoiceSearchController? voiceSearchController;
+  final void Function(int surah, int ayah)? onSelectVoiceCandidate;
+  final ValueChanged<bool>? onVoiceSearchHoldChanged;
   final VoidCallback onClearBuffer;
 
   const TrackingScreen({
@@ -35,6 +39,10 @@ class TrackingScreen extends StatefulWidget {
     required this.isRecording,
     required this.isVoiceSearching,
     this.voiceSearchText = '',
+    this.voiceSearchTextNotifier,
+    this.voiceSearchController,
+    this.onSelectVoiceCandidate,
+    this.onVoiceSearchHoldChanged,
     required this.onToggleRecord,
     required this.onVoiceSearchToggle,
     this.isLoadingEngine = false,
@@ -48,79 +56,152 @@ class TrackingScreen extends StatefulWidget {
 
 class _TrackingScreenState extends State<TrackingScreen>
     with TickerProviderStateMixin, WidgetsBindingObserver {
-  final ScrollController _scroll = ScrollController();
-  final ListController _listController = ListController();
-  final Map<int, GlobalKey> _keys = {};
-  final ValueNotifier<String> _voiceSearchNotifier = ValueNotifier('');
+  static const MethodChannel _lifecycleChannel =
+      MethodChannel('com.recitequran.app/audio_lifecycle');
 
+  final ValueNotifier<String> _voiceSearchNotifier = ValueNotifier('');
+  final GlobalKey<VerseListViewState> _verseListKey =
+      GlobalKey<VerseListViewState>();
+  final ValueNotifier<bool> _isAutoScrolling = ValueNotifier<bool>(false);
+  late final ValueNotifier<int> _surahNotifier;
+
+  AppBannerInfo? _lastBanner;
   int? _lastAyah;
   int? _lastSurah;
-  bool _isAutoScrolling = false;
-  
-  bool _showTajweedBanner = false;
+  late final Listenable _screenThemeLanguageListenable;
+  late final Listenable _bottomBarListenable;
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
-    WakelockPlus.enable();
+    final app = AppState.instance;
+    _surahNotifier = ValueNotifier<int>(_effectiveSurah);
+    _screenThemeLanguageListenable = Listenable.merge([
+      app.themeNotifier,
+      app.languageNotifier,
+      app.mushafModeNotifier,
+    ]);
+    _bottomBarListenable = Listenable.merge([
+      app.themeNotifier,
+      app.languageNotifier,
+      app.blurModeNotifier,
+      app.modeNotifier,
+      _surahNotifier,
+      MaglisController.instance.sessionListenable,
+    ]);
+    if (!PlatformCapabilities.isWeb) {
+      WidgetsBinding.instance.addObserver(this);
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
     widget.controller.addListener(_onControllerUpdate);
     widget.controller.activeAyah.addListener(_onActiveAyahChanged);
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    AppState.instance.mushafModeNotifier.addListener(_onMushafModeChanged);
+    AppState.instance.currentMushafPage.addListener(_onMushafPageChanged);
+
+    // Warm up Surah timings and Ayah 1 audio in memory/disk in the background for zero-latency instant play
+    unawaited(QuranTimingService.instance
+        .ensureSurahLoaded(widget.controller.targetSurah));
+    if (!PlatformCapabilities.isWeb) {
+      unawaited(QuranAudioService.ensureAyahDownloaded(
+          widget.controller.targetSurah, 1));
+    }
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.inactive ||
-        state == AppLifecycleState.hidden ||
-        state == AppLifecycleState.detached) {
-      if (widget.isRecording) {
-        widget.onToggleRecord();
+    if (PlatformCapabilities.isWeb) return;
+
+    final bool isDesktop = PlatformCapabilities.isDesktop;
+
+    if (state == AppLifecycleState.detached) {
+      QuranAudioService.instance.stop();
+      if (widget.isRecording) widget.onToggleRecord();
+      if (widget.isVoiceSearching) widget.onVoiceSearchToggle();
+      return;
+    }
+
+    if (!isDesktop) {
+      if (state == AppLifecycleState.paused ||
+          state == AppLifecycleState.inactive ||
+          state == AppLifecycleState.hidden) {
+        if (widget.isRecording || QuranAudioService.instance.isSingleWordMode) {
+          QuranAudioService.instance.stop();
+        } else if (state == AppLifecycleState.paused) {
+          // TODO(playstore-fgs): While FOREGROUND_SERVICE_MEDIA_PLAYBACK is disabled,
+          // allow audio on screen-off/lock (like v1.2.0+22) and stop if user minimized app.
+          if (defaultTargetPlatform == TargetPlatform.android) {
+            unawaited(_checkAndStopAudioIfMinimized());
+          } else if (defaultTargetPlatform != TargetPlatform.iOS) {
+            QuranAudioService.instance.stop();
+          }
+        }
+        // Microphone recording and voice search are suspended.
+        if (widget.isRecording) {
+          widget.onToggleRecord();
+        }
+        if (widget.isVoiceSearching) {
+          widget.onVoiceSearchToggle();
+        }
       }
-      if (widget.isVoiceSearching) {
-        widget.onVoiceSearchToggle();
+    }
+  }
+
+  Future<void> _checkAndStopAudioIfMinimized() async {
+    try {
+      final isOffOrLocked =
+          await _lifecycleChannel.invokeMethod<bool>('isScreenOffOrLocked') ??
+              false;
+      if (!isOffOrLocked) {
+        await QuranAudioService.instance.stop();
       }
-      if (_isAutoScrolling) {
-        _toggleAutoScroll();
-      }
+    } catch (_) {
+      await QuranAudioService.instance.stop();
     }
   }
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
+    AppState.instance.stopVerseAudio();
+    if (!PlatformCapabilities.isWeb) {
+      WidgetsBinding.instance.removeObserver(this);
+    }
     widget.controller.removeListener(_onControllerUpdate);
     widget.controller.activeAyah.removeListener(_onActiveAyahChanged);
-    _scroll.dispose();
+    AppState.instance.mushafModeNotifier.removeListener(_onMushafModeChanged);
+    AppState.instance.currentMushafPage.removeListener(_onMushafPageChanged);
     _voiceSearchNotifier.dispose();
-    WakelockPlus.disable();
+    _isAutoScrolling.dispose();
+    _surahNotifier.dispose();
     super.dispose();
   }
 
   @override
   void didUpdateWidget(TrackingScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.isRecording && !oldWidget.isRecording) {
-      _lastAyah = null;
-      final match = widget.controller.currentMatchedVerse;
-      if (match != null && match.verse.surah == widget.controller.targetSurah) {
-        _forceScrollToAyah(match.verse.ayah);
-      }
+    if (widget.controller != oldWidget.controller) {
+      _surahNotifier.value = widget.controller.targetSurah;
     }
-
-    if (widget.voiceSearchText != oldWidget.voiceSearchText) {
-      _voiceSearchNotifier.value = widget.voiceSearchText;
+    if (widget.isRecording && !oldWidget.isRecording) {
+      AppState.instance.dismissBanner();
+      final int targetAyah =
+          widget.controller.currentMatchedVerse?.verse.ayah ??
+              widget.controller.activeAyah.value ??
+              1;
+      _lastAyah = targetAyah;
     }
 
     if (widget.isVoiceSearching && !oldWidget.isVoiceSearching) {
-      _voiceSearchNotifier.value = widget.voiceSearchText;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
-          VoiceSearchDialog.show(
-            context, 
+          DialogService.showVoiceSearch(
+            context,
             onStop: widget.onVoiceSearchToggle,
             isLoading: widget.isVoiceSearchLoading,
+            asrTextNotifier:
+                widget.voiceSearchTextNotifier ?? _voiceSearchNotifier,
+            searchResultNotifier: widget.voiceSearchController?.currentResult,
+            onSelectCandidate: widget.onSelectVoiceCandidate,
+            onHoldChanged: widget.onVoiceSearchHoldChanged,
           );
         }
       });
@@ -135,274 +216,303 @@ class _TrackingScreenState extends State<TrackingScreen>
 
   void _onControllerUpdate() {
     if (widget.controller.targetSurah != _lastSurah) {
-      if (mounted) {
+      final newSurah = widget.controller.targetSurah;
+      _surahNotifier.value = newSurah;
+      void applyUpdate() {
+        if (!mounted) return;
         setState(() {
-          _lastSurah = widget.controller.targetSurah;
-          _keys.clear();
+          _lastSurah = newSurah;
           _lastAyah = null;
         });
-      } else {
-        _lastSurah = widget.controller.targetSurah;
-        _keys.clear();
-        _lastAyah = null;
       }
 
-      if (_scroll.hasClients) {
-        _scroll.jumpTo(0);
+      if (SchedulerBinding.instance.schedulerPhase ==
+          SchedulerPhase.persistentCallbacks) {
+        SchedulerBinding.instance.addPostFrameCallback((_) => applyUpdate());
+      } else {
+        applyUpdate();
       }
     }
   }
 
   void _onActiveAyahChanged() {
+    if (QuranAudioService.instance.isSingleWordMode) return;
+
     final active = widget.controller.activeAyah.value;
-    final match = widget.controller.currentMatchedVerse;
-    if (active != null &&
-        active != _lastAyah &&
-        match != null &&
-        match.verse.surah == widget.controller.targetSurah) {
+    if (active != null && active != _lastAyah) {
       _lastAyah = active;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) {
-          _forceScrollToAyah(active);
-        }
-      });
+      AppState.instance.saveLastPosition(widget.controller.targetSurah, active);
     }
   }
 
-  void _forceScrollToAyah(int ayah) {
-    if (!_scroll.hasClients) return;
-
-    if (ayah == 1) {
-      _scroll.animateTo(
-        0,
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeOutCubic,
-      );
-      return;
-    }
-
-    _listController.jumpToItem(
-      index: ayah,
-      scrollController: _scroll,
-      alignment: 0.5,
-    );
-  }
-
-  void _toggleAutoScroll() async {
-    if (_isAutoScrolling) {
-      setState(() => _isAutoScrolling = false);
-      if (_scroll.hasClients) {
-        _scroll.jumpTo(_scroll.position.pixels);
+  void _onMushafModeChanged() {
+    _isAutoScrolling.value = false;
+    final bool isMushaf = AppState.instance.isMushafMode;
+    if (isMushaf) {
+      final int currentSurah = widget.controller.targetSurah;
+      final int currentAyah =
+          widget.controller.activeAyah.value ?? AppState.instance.lastAyah;
+      final mappedPage =
+          MushafView.getPageForAyah(currentSurah, currentAyah) ??
+              MushafView.getPageForAyah(currentSurah, 1);
+      if (mappedPage != null) {
+        AppState.instance.saveMushafPage(mappedPage);
       }
-      WakelockPlus.disable();
     } else {
-      final prefs = await SharedPreferences.getInstance();
-      final hasChosenSpeed = prefs.getBool('has_chosen_speed') ?? false;
-      if (!hasChosenSpeed && mounted) {
-        showDialog(
-          context: context,
-          barrierDismissible: false,
-          builder: (ctx) => SpeedSelectionDialog(
-            onSpeedSelected: () {
-              prefs.setBool('has_chosen_speed', true);
-              Navigator.of(ctx).pop();
-              _toggleAutoScroll();
-            },
-          ),
+      final int targetSurah = _effectiveSurah;
+      if (widget.controller.targetSurah != targetSurah) {
+        widget.controller.setTargetSurah(
+          targetSurah,
+          preserveOtherSurahStates: true,
+          clearTargetSurah: false,
         );
-        return;
       }
+    }
+    _surahNotifier.value = _effectiveSurah;
+  }
 
-      widget.controller.clearHighlights();
-      widget.controller.finalize();
-      setState(() => _isAutoScrolling = true);
-      _startAutoScrollLoop();
-      WakelockPlus.enable();
+  void _onMushafPageChanged() {
+    if (AppState.instance.isMushafMode) {
+      final newSurah = _effectiveSurah;
+      if (_surahNotifier.value != newSurah) {
+        _surahNotifier.value = newSurah;
+      }
     }
   }
 
-  void _startAutoScrollLoop() {
-    if (!_isAutoScrolling || !mounted || !_scroll.hasClients) return;
-
-    double baseSpeed =
-        ((AppState.instance.fontSize / 24.0) * 1.5) * (16.0 / 50.0);
-    const speedMultipliers = [0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0];
-    int speedIndex = AppState.instance.autoScrollSpeed.clamp(
-      0,
-      speedMultipliers.length - 1,
-    );
-    double speedPerFrame = baseSpeed * speedMultipliers[speedIndex];
-    final double pixelsPerSec = speedPerFrame * 60;
-
-    final position = _scroll.position;
-    final distance = position.maxScrollExtent - position.pixels;
-
-    if (distance <= 0.5) {
-      setState(() => _isAutoScrolling = false);
-      WakelockPlus.disable();
-      return;
+  int get _effectiveSurah {
+    if (AppState.instance.isMushafMode) {
+      final page = AppState.instance.currentMushafPage.value;
+      final activeAyah = widget.controller.activeAyah.value;
+      final activeSurah = widget.controller.targetSurah;
+      if (activeAyah != null &&
+          MushafView.isAyahOnPage(
+            pageNumber: page,
+            surah: activeSurah,
+            ayah: activeAyah,
+          )) {
+        return activeSurah;
+      }
+      final dominant = MushafView.getDominantSurahOnPage(page);
+      if (dominant != null) {
+        return dominant;
+      }
+      final first = MushafView.getFirstAyahOnPage(page);
+      if (first != null) {
+        return first.$1;
+      }
     }
-
-    final durationSeconds = distance / pixelsPerSec;
-
-    _scroll
-        .animateTo(
-          position.maxScrollExtent,
-          duration: Duration(milliseconds: (durationSeconds * 1000).toInt()),
-          curve: Curves.linear,
-        )
-        .then((_) {
-          if (mounted && _isAutoScrolling) {
-            if (_scroll.hasClients &&
-                (_scroll.position.maxScrollExtent - _scroll.position.pixels) >
-                    2.0) {
-              _startAutoScrollLoop();
-            } else {
-              setState(() => _isAutoScrolling = false);
-              WakelockPlus.disable();
-            }
-          }
-        });
+    return widget.controller.targetSurah;
   }
 
   void _showSurahPicker() {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => SurahPickerSheet(
-        current: widget.controller.targetSurah,
-        controller: widget.controller,
-        isRecording: widget.isRecording,
-        isVoiceSearching: widget.isVoiceSearching,
-        onToggleRecord: widget.onToggleRecord,
-        onVoiceSearchToggle: widget.onVoiceSearchToggle,
-        onPick: (n, {ayah}) async {
+    DialogService.showSurahPicker(
+      context,
+      current: _effectiveSurah,
+      controller: widget.controller,
+      isRecording: widget.isRecording,
+      isVoiceSearching: widget.isVoiceSearching,
+      onToggleRecord: widget.onToggleRecord,
+      onVoiceSearchToggle: widget.onVoiceSearchToggle,
+      onPick: (n, {ayah}) async {
+          QuranAudioService.instance.stop();
           if (widget.isRecording) {
             widget.onToggleRecord();
           }
           if (Navigator.of(context).canPop()) {
             Navigator.pop(context);
           }
-          if (_scroll.hasClients) {
-            _scroll.jumpTo(0);
-          }
+          if (!mounted) return;
 
-          await widget.controller.setTargetSurah(n);
-          if (ayah != null) {
-            widget.controller.setManualAyah(n, ayah);
+          final targetAyah = ayah ?? 1;
+          await widget.controller.setTargetSurah(
+            n,
+            preserveOtherSurahStates: true,
+            clearTargetSurah: false,
+          );
+          widget.controller.setManualAyah(n, targetAyah);
+          AppState.instance.saveLastPosition(n, targetAyah);
+          final mappedPage =
+              MushafView.getPageForAyah(n, targetAyah);
+          if (mappedPage != null) {
+            AppState.instance.saveMushafPage(mappedPage);
           }
+          unawaited(QuranTimingService.instance.ensureSurahLoaded(n));
+          unawaited(QuranAudioService.ensureAyahDownloaded(n, 1));
 
           setState(() {
-            _keys.clear();
             _lastAyah = null;
           });
         },
-      ),
     );
   }
 
   void _showSettingsDialog() {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      builder: (_) => const SettingsDialog(),
+    DialogService.showSettings(context);
+  }
+
+  void _showSpeedSelectionDialog() {
+    DialogService.showSpeedSelection(
+      context,
+      onSpeedSelected: () => AppState.instance.setHasChosenAutoScrollSpeed(true),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final top = MediaQuery.of(context).padding.top;
+    final bottom = MediaQuery.paddingOf(context).bottom;
+    final safeLeft = MediaQuery.paddingOf(context).left;
+    final double pageLabelLeft = safeLeft + 16.0;
     final app = AppState.instance;
 
     return ListenableBuilder(
-      listenable: app,
-      builder: (_, _) {
+      listenable: _screenThemeLanguageListenable,
+      builder: (context, child) {
         final c = app.colors;
 
         return Directionality(
-          textDirection: TextDirection.rtl,
+          textDirection: app.isArabic ? TextDirection.rtl : TextDirection.ltr,
           child: Scaffold(
+            resizeToAvoidBottomInset: false,
             backgroundColor: c.bg,
-            body: Stack(
-              fit: StackFit.expand,
-              children: [
-                // Main Verse Content
-                Positioned.fill(child: _buildVerseContent(c, app, top)),
+            body: ValueListenableBuilder<bool>(
+              valueListenable: _isAutoScrolling,
+              child: Positioned.fill(child: _buildVerseContent(c, app)),
+              builder: (context, isAutoScrolling, verseContentChild) {
+                return Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    // Main Verse Content (Mushaf View or Verse List View - preserved across auto-scroll toggles)
+                    if (verseContentChild != null) verseContentChild,
 
-                // Top Floating Header
-                Positioned(
-                  top: 0,
-                  left: 0,
-                  right: 0,
-                  child: AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 300),
-                    transitionBuilder: (child, animation) {
-                      return SlideTransition(
-                        position: Tween<Offset>(
-                          begin: const Offset(0, -1),
-                          end: Offset.zero,
-                        ).animate(
-                          CurvedAnimation(
-                            parent: animation,
-                            curve: Curves.easeOutCubic,
+                    // Bottom Action Bar (Unified Glassmorphic Command Dock)
+                    // Disappears during auto-scroll for zero-distraction teleprompter reading!
+                    AnimatedPositioned(
+                      duration: const Duration(milliseconds: 280),
+                      curve: Curves.easeOutCubic,
+                      bottom: (!app.isMushafMode && isAutoScrolling) ? -90.0 : 0,
+                      left: 0,
+                      right: 0,
+                      child: AnimatedOpacity(
+                        duration: const Duration(milliseconds: 220),
+                        opacity: (!app.isMushafMode && isAutoScrolling) ? 0.0 : 1.0,
+                        child: IgnorePointer(
+                          ignoring: !app.isMushafMode && isAutoScrolling,
+                          child: AnimatedBuilder(
+                            animation: _bottomBarListenable,
+                            builder: (context, _) {
+                              final effectiveSurah = _effectiveSurah;
+                              final surahName =
+                                  _getSurahName(effectiveSurah, app.isArabic);
+                              final maglis = MaglisController.instance;
+                              final int peerCount = maglis.participantCount;
+
+                              return BottomActionBar(
+                                key: const ValueKey('unified_dock_bar'),
+                                isRecording: widget.isRecording,
+                                isLoadingEngine: widget.isLoadingEngine,
+                                c: c,
+                                onMic: () {
+                                  app.dismissBanner();
+                                  if (widget.isVoiceSearching) {
+                                    widget.onVoiceSearchToggle();
+                                  } else {
+                                    widget.onToggleRecord();
+                                  }
+                                },
+                                isBlur: app.isBlurMode,
+                                onToggleBlur: () {
+                                  app.toggleBlurMode();
+                                  if (app.isBlurMode) {
+                                    app.showBlurBanner(true);
+                                  } else {
+                                    app.dismissBanner();
+                                  }
+                                },
+                                isTajweed: app.currentMode == AppMode.tajweed,
+                                onToggleTajweed: () {
+                                  final bool newIsTajweed =
+                                      app.currentMode != AppMode.tajweed;
+                                  if (newIsTajweed) {
+                                    app.setMode(AppMode.tajweed);
+                                    widget.controller.setTajweedMode(true);
+                                    app.showTajweedBanner();
+                                  } else {
+                                    app.setMode(AppMode.wordChecker);
+                                    widget.controller.setTajweedMode(false);
+                                    app.dismissTajweedBanner();
+                                  }
+                                },
+                                surahName: surahName,
+                                onSurahTap: _showSurahPicker,
+                                onSettingsTap: () {
+                                  _showSettingsDialog();
+                                },
+                                isInMaglis: maglis.inSession,
+                                maglisRoomCode: maglis.roomCode,
+                                maglisPeerCount: peerCount,
+                                isRemoteReciting: maglis.isRemoteReciting,
+                                onMaglisTap: () async {
+                                  app.recordMaglisTap();
+                                  if (!app.hasSeenMaglisExplanation) {
+                                    await DialogService.showMaglisExplanation(context);
+                                    if (context.mounted) {
+                                      DialogService.showMaglisEntry(context);
+                                    }
+                                  } else {
+                                    DialogService.showMaglisEntry(context);
+                                  }
+                                },
+                                onMaglisExitTap: () async {
+                                  if (widget.isRecording) {
+                                    widget.onToggleRecord();
+                                  }
+                                  app.exitMaglisSession();
+                                  await maglis.leaveSession();
+                                  app.showBanner(AppBannerInfo(
+                                    id: 'maglis_left',
+                                    messageAr: 'تمت مغادرة المجلس بنجاح',
+                                    messageEn: 'Left Maglis session',
+                                    icon: Icons.exit_to_app_rounded,
+                                  ));
+                                },
+                              );
+                            },
                           ),
                         ),
-                        child: child,
-                      );
-                    },
-                    child: _buildHeader(c, app, top),
-                  ),
-                ),
-
-                // Bottom Action Bar
-                AnimatedPositioned(
-                  duration: const Duration(milliseconds: 250),
-                  curve: Curves.easeOutCubic,
-                  bottom: 0,
-                  left: 0,
-                  right: 0,
-                  child: AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 400),
-                    transitionBuilder: (child, animation) {
-                      return SlideTransition(
-                        position: Tween<Offset>(
-                          begin: const Offset(0, 1),
-                          end: Offset.zero,
-                        ).animate(
-                          CurvedAnimation(
-                            parent: animation,
-                            curve: Curves.easeOutCubic,
-                          ),
-                        ),
-                        child: child,
-                      );
-                    },
-                    child: BottomActionBar(
-                      key: const ValueKey('word_checker_bar'),
-                      isRecording: widget.isRecording,
-                      isLoadingEngine: widget.isLoadingEngine,
-                      isVoiceSearching: widget.isVoiceSearching,
-                      isAutoScrolling: _isAutoScrolling,
-                      c: c,
-                      onMic: () {
-                        if (_showTajweedBanner) setState(() => _showTajweedBanner = false);
-                        if (widget.isVoiceSearching) {
-                          widget.onVoiceSearchToggle();
-                        } else {
-                          widget.onToggleRecord();
-                        }
-                      },
-                      onToggleAutoScroll: () {
-                        if (_showTajweedBanner) setState(() => _showTajweedBanner = false);
-                        _toggleAutoScroll();
-                      },
-                      onSettingsTap: _showSettingsDialog,
+                      ),
                     ),
-                  ),
-                ),
-              ],
+
+                    // Auto-Scroll / Pause button in Verse List mode (occupies the exact spot as Page Number in Mushaf layout)
+                    if (!app.isMushafMode && !widget.isRecording && !widget.isVoiceSearching)
+                      AnimatedPositioned(
+                        duration: const Duration(milliseconds: 280),
+                        curve: Curves.easeOutCubic,
+                        left: pageLabelLeft - 13.0,
+                        bottom: isAutoScrolling ? (bottom + 18.0 - 13.0) : (bottom + 60.0 - 13.0),
+                        child: _AutoScrollFloatingButton(
+                          isAutoScrolling: isAutoScrolling,
+                          c: c,
+                          app: app,
+                          onTap: () {
+                            _verseListKey.currentState?.toggleAutoScroll();
+                          },
+                          onLongPress: _showSpeedSelectionDialog,
+                        ),
+                      ),
+
+                    // Modern Floating Slide-Up Banner (Scoped listener prevents full screen rebuilds)
+                    ValueListenableBuilder<AppBannerInfo?>(
+                      valueListenable: app.bannerNotifier,
+                      builder: (context, activeBanner, _) =>
+                          _buildModernBottomBanner(c, app, bottom, activeBanner),
+                    ),
+
+                    // Floating Download Progress Pill (appears when download dialog is minimized)
+                    _buildMinimizedDownloadPill(c, app, bottom),
+                  ],
+                );
+              },
             ),
           ),
         );
@@ -410,335 +520,335 @@ class _TrackingScreenState extends State<TrackingScreen>
     );
   }
 
-  Widget _buildHeader(ThemeColors c, AppState app, double top) {
-    if (widget.isRecording || _isAutoScrolling) {
-      return const SizedBox.shrink(key: ValueKey('empty_header'));
+  /// Floating pill shown when Quran audio download is minimized.
+  Widget _buildMinimizedDownloadPill(
+      ThemeColors c, AppState app, double bottom) {
+    return ListenableBuilder(
+      listenable: Listenable.merge([
+        QuranDownloadService.instance.isDownloading,
+        QuranDownloadService.instance.isMinimized,
+        QuranDownloadService.instance.progress,
+      ]),
+      builder: (context, _) {
+        final isDownloading = QuranDownloadService.instance.isDownloading.value;
+        final isMinimized = QuranDownloadService.instance.isMinimized.value;
+        if (!isDownloading || !isMinimized) {
+          return const SizedBox.shrink();
+        }
+
+        final progress = QuranDownloadService.instance.progress.value;
+        final percent = (progress * 100).toInt();
+        final isAr = app.isArabic;
+        final isDark = app.isDarkMode;
+
+        return Positioned(
+          bottom: bottom + 12,
+          left: 16,
+          right: 16,
+          child: Center(
+            child: Material(
+              color: Colors.transparent,
+              child: InkWell(
+                borderRadius: BorderRadius.circular(24),
+                onTap: () => AudioDownloadDialog.show(context),
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: isDark ? const Color(0xFF1E293B) : Colors.white,
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(
+                      color: c.primary.withValues(alpha: isDark ? 0.40 : 0.25),
+                      width: 1.2,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black
+                            .withValues(alpha: isDark ? 0.35 : 0.12),
+                        blurRadius: 12,
+                        offset: const Offset(0, 4),
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2.2,
+                          value: progress.clamp(0.0, 1.0),
+                          valueColor: AlwaysStoppedAnimation<Color>(c.primary),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Text(
+                        isAr
+                            ? 'جاري تحميل التلاوة: ${QuranTypography.toArabicDigits(percent)}٪'
+                            : 'Downloading Audio: $percent%',
+                        style: TextStyle(
+                          fontFamily: 'cairo',
+                          color: c.text,
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      Icon(Icons.open_in_full_rounded,
+                          size: 14, color: c.muted),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  String _getSurahName(int surahNum, bool isArabic) {
+    final metadata = widget.controller.repository.surahMetadata;
+    if (surahNum >= 1 && surahNum <= metadata.length) {
+      final s = metadata[surahNum - 1];
+      return isArabic ? s.surahName : s.surahNameEn;
+    }
+    final verse1 = widget.controller.repository.getVerse(surahNum, 1);
+    return isArabic ? (verse1?.surahName ?? '') : (verse1?.surahNameEn ?? '');
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Modern Floating Slide-Up Banner (Slides UP from bottom toolbar for all notices)
+  // ──────────────────────────────────────────────────────────────────────────
+  Widget _buildModernBottomBanner(
+      ThemeColors c, AppState app, double bottom, AppBannerInfo? activeBanner) {
+    final bool isDark = app.isDarkMode;
+    final bool isAr = app.isArabic;
+    final bool isVisible = activeBanner != null;
+
+    if (activeBanner != null) {
+      _lastBanner = activeBanner;
+    }
+    final banner = activeBanner ?? _lastBanner;
+    if (banner == null) {
+      return const SizedBox.shrink();
     }
 
-    return Padding(
-      key: const ValueKey('header_main'),
-      padding: EdgeInsets.only(top: top + 10, left: 14, right: 14, bottom: 8),
-      child: Stack(
-        clipBehavior: Clip.none,
-        children: [
-          // The Dropdown Banner
-          AnimatedPositioned(
-            duration: Duration(milliseconds: _showTajweedBanner ? 600 : 300),
-            curve: _showTajweedBanner ? Curves.elasticOut : Curves.easeOutCubic,
-            top: _showTajweedBanner ? 50 : 0, // Slides out from beneath the 56px container
-            left: 16,
-            right: 16,
-            child: AnimatedOpacity(
-              duration: const Duration(milliseconds: 300),
-              opacity: _showTajweedBanner ? 1.0 : 0.0,
-              child: Container(
-                padding: const EdgeInsets.only(top: 16, bottom: 8, left: 12, right: 12),
-                decoration: BoxDecoration(
-                  color: c.surface,
-                  borderRadius: const BorderRadius.only(
-                    bottomLeft: Radius.circular(16),
-                    bottomRight: Radius.circular(16),
+    final Color accentColor;
+    if (banner.customColor != null) {
+      accentColor = banner.customColor!(c, isDark);
+    } else if (banner.isWarning) {
+      accentColor = isDark ? const Color(0xFFF59E0B) : const Color(0xFFD97706);
+    } else {
+      accentColor = c.primary;
+    }
+
+    final Color iconColor =
+        (banner.isWarning && isDark) ? const Color(0xFFFBBF24) : accentColor;
+    final String message = isAr ? banner.messageAr : banner.messageEn;
+
+    return AnimatedPositioned(
+      duration: const Duration(milliseconds: 280),
+      curve: Curves.easeOutCubic,
+      bottom: isVisible ? (bottom + 78) : (bottom + 16),
+      left: 16,
+      right: 16,
+      child: IgnorePointer(
+        ignoring: !isVisible,
+        child: AnimatedOpacity(
+          duration: const Duration(milliseconds: 240),
+          opacity: isVisible ? 1.0 : 0.0,
+          child: RepaintBoundary(
+            child: Center(
+              child: GestureDetector(
+                onTap: () {
+                  app.dismissBanner();
+                },
+                child: Container(
+                  constraints: const BoxConstraints(maxWidth: 460),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: isDark ? c.surfaceHigh : c.surface,
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: accentColor.withValues(alpha: isDark ? 0.38 : 0.30),
+                      width: 1.1,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color:
+                            Colors.black.withValues(alpha: isDark ? 0.35 : 0.08),
+                        blurRadius: 14,
+                        offset: const Offset(0, -3),
+                      ),
+                    ],
                   ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.1),
-                      blurRadius: 10,
-                      offset: const Offset(0, 4),
-                    )
-                  ],
-                  border: Border(
-                    bottom: BorderSide(color: c.gold.withValues(alpha: 0.3)),
-                    left: BorderSide(color: c.gold.withValues(alpha: 0.3)),
-                    right: BorderSide(color: c.gold.withValues(alpha: 0.3)),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 28,
+                        height: 28,
+                        decoration: BoxDecoration(
+                          color:
+                              accentColor.withValues(alpha: isDark ? 0.20 : 0.12),
+                          borderRadius: BorderRadius.circular(9),
+                          border: Border.all(
+                            color: accentColor.withValues(
+                                alpha: isDark ? 0.42 : 0.32),
+                            width: 0.8,
+                          ),
+                        ),
+                        alignment: Alignment.center,
+                        child: Icon(
+                          banner.icon,
+                          color: iconColor,
+                          size: 16,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Flexible(
+                        child: Text(
+                          message,
+                          style: TextStyle(
+                            color: c.text,
+                            height: 1.35,
+                            fontWeight: FontWeight.w600,
+                            fontSize: 12.5,
+                          ),
+                          textAlign: isAr ? TextAlign.right : TextAlign.left,
+                          textDirection:
+                              isAr ? TextDirection.rtl : TextDirection.ltr,
+                        ),
+                      ),
+                    ],
                   ),
-                ),
-                child: Text(
-                  app.isArabic
-                      ? 'تم تفعيل التجويد و يمكنك الضغط على الكلمات باللون الاصفر لمعرفة نوع الخطأ'
-                      : 'Tajweed Enabled. Tap on yellow words to see error details.',
-                  style: TextStyle(color: c.text, height: 1.4, fontWeight: FontWeight.w600, fontSize: 12),
-                  textAlign: TextAlign.center,
-                  textDirection: app.isArabic ? TextDirection.rtl : TextDirection.ltr,
                 ),
               ),
             ),
           ),
-          
-          // The Actual Header Container
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-            decoration: BoxDecoration(
-              color: c.surface,
-              borderRadius: BorderRadius.circular(22),
-              border: Border.all(color: c.border.withValues(alpha: 0.4)),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.04),
-                  blurRadius: 20,
-                  offset: const Offset(0, 4),
-                ),
-              ],
-            ),
-            child: Row(
-          mainAxisSize: MainAxisSize.max,
-          children: [
-            // Surah Selector
-            Flexible(
-              flex: 4,
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 180),
-                child: GestureDetector(
-                  onTap: _showSurahPicker,
-                  behavior: HitTestBehavior.opaque,
-                  child: Container(
-                    height: 44,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 8,
-                    ),
-                    decoration: BoxDecoration(
-                      color: c.gold.withValues(alpha: 0.1),
-                      borderRadius: BorderRadius.circular(16),
-                    ),
-                    child: LayoutBuilder(
-                      builder: (context, constraints) {
-                        return Row(
-                          children: [
-                            Expanded(
-                              child: Builder(
-                                builder: (context) {
-                                  final displayVerses = widget.controller.repository
-                                      .getSurah(widget.controller.targetSurah);
-                                  return FittedBox(
-                                    fit: BoxFit.scaleDown,
-                                    alignment: app.isArabic
-                                        ? Alignment.centerRight
-                                        : Alignment.centerLeft,
-                                    child: Text(
-                                      app.isArabic
-                                          ? displayVerses.first.surahName
-                                          : displayVerses.first.surahNameEn,
-                                      style: TextStyle(
-                                        fontFamily: app.isArabic ? 'HafsSmart' : null,
-                                        color: c.gold,
-                                        fontSize: app.isArabic ? 18 : 15,
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                    ),
-                                  );
-                                },
-                              ),
-                            ),
-                            if (constraints.maxWidth > 40) ...[
-                              const SizedBox(width: 4),
-                              Icon(
-                                Icons.keyboard_arrow_down_rounded,
-                                color: c.gold,
-                                size: 20,
-                              ),
-                            ],
-                          ],
-                        );
-                      }
-                    ),
-                  ),
-                ),
-              ),
-            ),
-
-            const SizedBox(width: 8),
-
-            // Action Buttons
-            Expanded(
-              flex: 6,
-              child: Row(
-                children: [
-                  Expanded(
-                    child: _buildActionBtn(
-                      icon: Icons.auto_stories_rounded,
-                      label: app.isArabic ? 'قراءة' : 'Read',
-                      color: c.text,
-                      onTap: _toggleAutoScroll,
-                    ),
-                  ),
-                  Expanded(
-                    child: _buildActionBtn(
-                      icon: app.isBlurMode
-                          ? Icons.visibility_off_rounded
-                          : Icons.visibility_rounded,
-                      label: app.isArabic ? 'إخفاء' : 'Hide',
-                      color: app.isBlurMode ? c.green : c.text,
-                      onTap: app.toggleBlurMode,
-                    ),
-                  ),
-                  Expanded(
-                    child: _buildActionBtn(
-                      icon: Icons.format_color_text_rounded,
-                      label: app.isArabic ? 'تجويد' : 'Tajweed',
-                      color: app.currentMode == AppMode.tajweed
-                          ? c.green
-                          : c.text,
-                      onTap: () {
-                        final newMode = app.currentMode == AppMode.tajweed
-                            ? AppMode.wordChecker
-                            : AppMode.tajweed;
-                        app.setMode(newMode);
-                        widget.controller.setTajweedMode(
-                          newMode == AppMode.tajweed,
-                        );
-
-                        if (newMode == AppMode.tajweed) {
-                          ScaffoldMessenger.of(context).clearSnackBars();
-                          setState(() => _showTajweedBanner = true);
-                          Future.delayed(const Duration(seconds: 2), () {
-                            if (mounted) setState(() => _showTajweedBanner = false);
-                          });
-                        }
-                      },
-                    ),
-                  ),
-                  Expanded(
-                    child: _buildActionBtn(
-                      icon: Icons.settings_rounded,
-                      label: app.isArabic ? 'إعدادات' : 'Settings',
-                      color: c.text,
-                      onTap: _showSettingsDialog,
-                      onLongPress: () async {
-                        try {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                              content: Text(
-                                'Preparing logs...',
-                                textDirection: TextDirection.ltr,
-                              ),
-                            ),
-                          );
-                          final String allLogs = globalSessionLogs.join('\n');
-                          await SharePlus.instance.share(
-                            ShareParams(
-                              text: allLogs.isNotEmpty
-                                  ? allLogs
-                                  : 'No logs recorded.',
-                              subject: 'ReciteQuran Logs',
-                            ),
-                          );
-                        } catch (e) {
-                          DebugLogger.logSimple(
-                            'TrackingScreen',
-                            "Error preparing logs: $e",
-                          );
-                        }
-                      },
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
         ),
-      ),
-      ],
       ),
     );
   }
 
-  Widget _buildActionBtn({
-    required IconData icon,
-    required String label,
-    required Color color,
-    required VoidCallback onTap,
-    VoidCallback? onLongPress,
-  }) {
+  Widget _buildVerseContent(ThemeColors c, AppState app) {
+    if (app.isMushafMode) {
+      return MushafView(
+        key: const ValueKey('mushaf_view_main'),
+        controller: widget.controller,
+        isRecording: widget.isRecording,
+        showBottomPageNumber: true,
+      );
+    }
+
+    return RepaintBoundary(
+      key: const ValueKey('verse_list_boundary'),
+      child: VerseListView(
+        key: _verseListKey,
+        controller: widget.controller,
+        isRecording: widget.isRecording,
+        onToggleRecord: widget.onToggleRecord,
+        onAutoScrollChanged: (scrolling) {
+          _isAutoScrolling.value = scrolling;
+        },
+      ),
+    );
+  }
+}
+
+/// Floating tactical button occupying the exact spot where the Mushaf page number sits.
+/// - In idle state: displays speed label (e.g. 1.0x) with scroll chevron; tap starts scroll, hold sets speed.
+/// - During auto-scroll: transforms smoothly into a Pause button; tap stops auto-scroll.
+class _AutoScrollFloatingButton extends StatefulWidget {
+  final bool isAutoScrolling;
+  final ThemeColors c;
+  final AppState app;
+  final VoidCallback onTap;
+  final VoidCallback onLongPress;
+
+  const _AutoScrollFloatingButton({
+    required this.isAutoScrolling,
+    required this.c,
+    required this.app,
+    required this.onTap,
+    required this.onLongPress,
+  });
+
+  @override
+  State<_AutoScrollFloatingButton> createState() =>
+      _AutoScrollFloatingButtonState();
+}
+
+class _AutoScrollFloatingButtonState extends State<_AutoScrollFloatingButton> {
+  bool _isDown = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = widget.app.isDarkMode;
+    final isScroll = widget.isAutoScrolling;
+
+    // Matches the styling and color semantics of the mic bar buttons (like community/maglis button)
+    final Color bgColor = isScroll
+        ? const Color(0xFF10B981).withValues(alpha: isDark ? 0.22 : 0.15)
+        : (isDark ? const Color(0xFF1B2430) : const Color(0xFFF1F5F9));
+
+    final Color borderColor = isScroll
+        ? const Color(0xFF10B981).withValues(alpha: isDark ? 0.75 : 0.60)
+        : (isDark
+            ? Colors.white.withValues(alpha: 0.10)
+            : Colors.black.withValues(alpha: 0.08));
+
+    final Color iconColor = isScroll
+        ? (isDark ? const Color(0xFF10B981) : const Color(0xFF059699))
+        : (isDark ? const Color(0xFFE2E8F0) : const Color(0xFF1E293B));
+
     return GestureDetector(
-      onTap: onTap,
-      onLongPress: onLongPress,
+      onTapDown: (_) => setState(() => _isDown = true),
+      onTapUp: (_) => setState(() => _isDown = false),
+      onTapCancel: () => setState(() => _isDown = false),
+      onTap: () {
+        widget.onTap();
+      },
+      onLongPress: () {
+        widget.onLongPress();
+      },
       behavior: HitTestBehavior.opaque,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, color: color, size: 22),
-            const SizedBox(height: 3),
-            Flexible(
-              child: FittedBox(
-                fit: BoxFit.scaleDown,
-                child: Text(
-                  label,
-                  maxLines: 1,
-                  style: TextStyle(
-                    color: color,
-                    fontSize: 10,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
+      child: Container(
+        width: 56,
+        height: 56,
+        color: Colors.transparent,
+        alignment: Alignment.center,
+        child: AnimatedScale(
+          scale: _isDown ? 0.90 : 1.0,
+          duration: const Duration(milliseconds: 100),
+          curve: Curves.easeOutCubic,
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeOutCubic,
+            width: 30,
+            height: 30,
+            decoration: BoxDecoration(
+              color: bgColor,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                color: borderColor,
+                width: isScroll ? 1.2 : 1.0,
               ),
             ),
-          ],
+            alignment: Alignment.center,
+            child: Icon(
+              isScroll
+                  ? Icons.pause_rounded
+                  : Icons.keyboard_double_arrow_down_rounded,
+              size: 16.5,
+              color: iconColor,
+            ),
+          ),
         ),
       ),
-    );
-  }
-
-  Widget _buildVerseContent(ThemeColors c, AppState app, double top) {
-    return Builder(
-      key: const ValueKey('verse_list_content'),
-      builder: (context) {
-        final displayVerses = widget.controller.repository.getSurah(
-          widget.controller.targetSurah,
-        );
-
-        final bool isMainRec = widget.isRecording;
-        final topPadding = (isMainRec || _isAutoScrolling)
-            ? top + 16
-            : top + 72;
-        final bottomPadding = (isMainRec || _isAutoScrolling) ? 140.0 : 200.0;
-
-        return CustomScrollView(
-          controller: _scroll,
-          physics: _isAutoScrolling
-              ? const NeverScrollableScrollPhysics()
-              : const BouncingScrollPhysics(),
-          slivers: [
-            SuperSliverList(
-              listController: _listController,
-              delegate: SliverChildBuilderDelegate(
-                (_, i) {
-                  if (i == 0) {
-                    return AnimatedContainer(
-                      duration: const Duration(milliseconds: 400),
-                      curve: Curves.easeOutCubic,
-                      height: topPadding,
-                    );
-                  }
-
-                  if (i == displayVerses.length + 1) {
-                    return AnimatedContainer(
-                      duration: const Duration(milliseconds: 400),
-                      curve: Curves.easeOutCubic,
-                      height: bottomPadding,
-                    );
-                  }
-
-                  final v = displayVerses[i - 1];
-
-                  return VerseRow(
-                    key: ValueKey('verse_${v.surah}_${v.ayah}'),
-                    verse: v,
-                    controller: widget.controller,
-                    isAutoScrolling: _isAutoScrolling,
-                    onTap: () {
-                      widget.controller.setManualAyah(v.surah, v.ayah);
-                    },
-                    onWordErrorTap: null,
-                  );
-                },
-                childCount: displayVerses.length + 2,
-              ),
-            ),
-          ],
-        );
-      },
     );
   }
 }
