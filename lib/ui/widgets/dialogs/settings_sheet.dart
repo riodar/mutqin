@@ -358,8 +358,8 @@ class SettingsSheet extends StatelessWidget {
               ),
 
               const SizedBox(height: 12),
-
-              // ── Telegram Contact Banner ──
+              
+              // ── WhatsApp Contact Banner ──
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 20),
                 child: Container(
@@ -369,7 +369,7 @@ class SettingsSheet extends StatelessWidget {
                         : Colors.white,
                     borderRadius: BorderRadius.circular(16),
                     border: Border.all(
-                      color: const Color(0xFF229ED9).withValues(
+                      color: const Color(0xFF25D366).withValues(
                           alpha: isDark ? 0.35 : 0.25),
                       width: 1,
                     ),
@@ -387,11 +387,19 @@ class SettingsSheet extends StatelessWidget {
                     child: InkWell(
                       borderRadius: BorderRadius.circular(16),
                       onTap: () async {
-                        final uri =
-                            Uri.parse('https://t.me/AlQuranElMageed');
+                        final uri = Uri.https(
+                          'wa.me',
+                          '/6281289610927',
+                          {
+                            'text':
+                                'Assalamualaikum, saya pengguna Mutqin AI.'
+                          },
+                        );
                         try {
-                          await launchUrl(uri,
-                              mode: LaunchMode.externalApplication);
+                          await launchUrl(
+                            uri,
+                            mode: LaunchMode.externalApplication,
+                          );
                         } catch (_) {}
                       },
                       child: Padding(
@@ -399,23 +407,10 @@ class SettingsSheet extends StatelessWidget {
                             horizontal: 14, vertical: 11),
                         child: Row(
                           children: [
-                            Stack(
-                              alignment: Alignment.center,
-                              children: [
-                                Container(
-                                  width: 22,
-                                  height: 22,
-                                  decoration: const BoxDecoration(
-                                    color: Colors.white,
-                                    shape: BoxShape.circle,
-                                  ),
-                                ),
-                                const Icon(
-                                  Icons.telegram,
-                                  color: Color(0xFF229ED9),
-                                  size: 36,
-                                ),
-                              ],
+                            const Icon(
+                              Icons.chat_rounded,
+                              color: Color(0xFF25D366),
+                              size: 32,
                             ),
                             const SizedBox(width: 12),
                             Expanded(
@@ -426,8 +421,8 @@ class SettingsSheet extends StatelessWidget {
                                 children: [
                                   Text(
                                     isAr
-                                        ? 'وأمرهم شورى بينهم'
-                                        : 'Their affair is mutual consultation',
+                                        ? 'تواصل معنا عبر واتساب'
+                                        : 'Contact Us via WhatsApp',
                                     style: TextStyle(
                                       color: c.text,
                                       fontSize: 13.5,
@@ -436,7 +431,7 @@ class SettingsSheet extends StatelessWidget {
                                   ),
                                   const SizedBox(height: 1.5),
                                   Text(
-                                    '@AlQuranElMageed',
+                                    '6281289610927',
                                     style: TextStyle(
                                       color: c.textSecondary
                                           .withValues(alpha: 0.8),
@@ -451,12 +446,12 @@ class SettingsSheet extends StatelessWidget {
                               padding: const EdgeInsets.symmetric(
                                   horizontal: 10, vertical: 6),
                               decoration: BoxDecoration(
-                                color: const Color(0xFF229ED9),
+                                color: const Color(0xFF25D366),
                                 borderRadius:
                                     BorderRadius.circular(10),
                               ),
                               child: Text(
-                                isAr ? 'مراسلة' : 'Message',
+                                isAr ? 'واتساب' : 'WhatsApp',
                                 style: const TextStyle(
                                   color: Colors.white,
                                   fontSize: 12,
