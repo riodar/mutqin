@@ -33,7 +33,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.recitequran.app"
+        applicationId = "com.mutqindarelfath.app"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
