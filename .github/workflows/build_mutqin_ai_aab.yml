@@ -73,7 +73,8 @@ jobs:
 
       - name: Install Flutter dependencies
         run: flutter pub get
-
+      - name: Generate Mutqin AI launcher icons
+        run: dart run flutter_launcher_icons
       - name: Build signed Android App Bundle
         run: flutter build appbundle --release
 
