@@ -3,6 +3,9 @@ name: Build Mutqin AI Android App Bundle
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feature/whatsapp-contact-app-icon-playstore
 
 permissions:
   contents: read
